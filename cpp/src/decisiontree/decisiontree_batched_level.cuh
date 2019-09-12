@@ -30,35 +30,30 @@ struct Split {
   static constexpr IdxT Invalid = static_cast<IdxT>(-1);
 
   /** threshold to compare in this node */
-  DataT threshold;
+  DataT quesval;
   /** feature index */
-  IdxT fidx;
+  IdxT colid;
   /** best info gain on this node */
   DataT gain;
   /** number of samples in the left child */
   IdxT nLeft;
 
   DI init() {
-    threshold = gain = Min;
-    fidx = Invalid;
+    quesval = gain = Min;
+    colid = Invalid;
     nLeft = 0;
   }
 
   DI Split<DataT, IdxT>& operator=(const Split<DataT, IdxT>& other) {
-    threshold = other.threshold;
-    fidx = other.fidx;
+    quesval = other.quesval;
+    colid = other.colid;
     gain = other.gain;
     nLeft = other.nLeft;
   }
 
   /** updates the current split if the input gain is better */
-  DI void update(DataT th, IdxT fi, DataT ga, IdxT nl) {
-    if (ga > gain) {
-      threshold = th;
-      fidx = fi;
-      gain = ga;
-      nLeft = nl;
-    }
+  DI void update(const Split<DataT, IdxT>& other) {
+    if (other.gain > gain) *this = other;
   }
 
   /** reduce the split info in the warp. Best split will be with 0th lane */
@@ -67,11 +62,11 @@ struct Split {
 #pragma unroll
     for (int i = WarpSize / 2; i >= 1; i /= 2) {
       auto id = lane + i;
-      auto th = MLCommon::shfl(threshold, id);
-      auto fi = MLCommon::shfl(fidx, id);
+      auto qu = MLCommon::shfl(quesval, id);
+      auto co = MLCommon::shfl(colid, id);
       auto ga = MLCommon::shfl(gain, id);
       auto nl = MLCommon::shfl(nLeft, id);
-      update(th, fi, ga, nl);
+      update(Split<DataT, IdxT>(qu, co, ga, nl));
     }
   }
 };  // end Split
@@ -342,7 +337,7 @@ DI void evalBestSplit(Split<DataT, IdxT>& s, void* smem,
   s.warpReduce();
   if (threadIdx.x == 0) {
     while(atomicCAS(mutex, 0, 1));
-    split->update(s.threshold, s.fidx, s.gain, s.nLeft);
+    split->update(s.quesval, s.colid, s.gain, s.nLeft);
     __threadfence();
     *mutex = 0;
     __threadfence();
@@ -430,7 +425,7 @@ DI void partitionSamples(const Input<DataT, LabelT, IdxT>& input,
   auto nid = blockIdx.x;
   auto split = splits[nid];
   auto range = curr_nodes[nid].range;
-  auto *col = input.data + split.fidx * input.M;
+  auto *col = input.data + split.colid * input.M;
   auto loffset = range.x, part = loffset + split.nLeft, roffset = part;
   auto end = range.x + range.y;
   int lflag = 0, rflag = 0, llen = 0, rlen = 0, minlen = 0;
@@ -439,9 +434,9 @@ DI void partitionSamples(const Input<DataT, LabelT, IdxT>& input,
     // find the samples in the left that belong to right and vice-versa
     auto loff = loffset + tid, roff = roffset + tid;
     if (llen == minlen)
-      lflag = loff < part ? col[rowids[loff]] > split.threshold : 0;
+      lflag = loff < part ? col[rowids[loff]] > split.quesval : 0;
     if (rlen == minlen)
-      rflag = roff < end ? col[rowids[roff]] <= split.threshold : 0;
+      rflag = roff < end ? col[rowids[roff]] <= split.quesval : 0;
     // scan to compute the locations for each 'misfit' in the two partitions
     int lidx, ridx;
     BlockScanT(temp1).ExclusiveSum(lflag, lidx, llen);
