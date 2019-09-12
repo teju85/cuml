@@ -441,12 +441,12 @@ DI void partitionSamples(const Input<DataT, LabelT, IdxT>& input,
     if (lflag) lcomp[lidx] = lidx + loffset;
     if (rflag) rcomp[ridx] = ridx + roffset;
     __syncthreads();
-    // reset the appropriate flags for the longer of the two
+    // reset the appropriate flags for the positions which will be swapped
     if (lidx < minlen) lflag = 0;
     if (ridx < minlen) rflag = 0;
     if (llen == minlen) loffset += TPB;
     if (rlen == minlen) roffset += TPB;
-    // swap the 'misfit's
+    // swap the 'misfits'
     if (tid < minlen) {
       auto a = rowids[lcomp[tid]];
       auto b = rowids[rcomp[tid]];
