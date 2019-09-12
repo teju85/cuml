@@ -26,8 +26,6 @@ template <typename DataT, typename IdxT>
 struct Split {
   /** start with this as the initial gain */
   static constexpr DataT Min = std::numeric_limits<DataT>::min();
-  /** special value to represent invalid column id */
-  static constexpr IdxT Invalid = static_cast<IdxT>(-1);
 
   /** threshold to compare in this node */
   DataT quesval;
@@ -40,7 +38,7 @@ struct Split {
 
   DI init() {
     quesval = gain = Min;
-    colid = Invalid;
+    colid = -1;
     nLeft = 0;
   }
 
@@ -66,7 +64,8 @@ struct Split {
       auto co = MLCommon::shfl(colid, id);
       auto ga = MLCommon::shfl(gain, id);
       auto nl = MLCommon::shfl(nLeft, id);
-      update(Split<DataT, IdxT>(qu, co, ga, nl));
+      Split<DataT, IdxT> tmp = {qu, co, ga, nl};
+      update(tmp);
     }
   }
 };  // end Split
@@ -182,24 +181,24 @@ struct SparseTree {
   /**
    * @brief After the current batch is finished processing, update the range
    *        of nodes to be worked upon in the next batch
-   * @param max_batch_size max number of nodes to be processed in a batch
+   * @param max_batch max number of nodes to be processed in a batch
    */
-  void updateNodeRange(IdxT max_batch_size) {
+  void updateNodeRange(IdxT max_batch) {
     start = end;
     auto nodes_remaining = n_nodes - end;
-    end = std::min(nodes_remaining, max_batch_size) + end;
+    end = std::min(nodes_remaining, max_batch) + end;
   }
 };
 
 template <typename DataT, typename LabelT, typename IdxT>
 struct Input {
-  /** input dataset (assumed to be col-major) */
+  /** input unsampled dataset (assumed to be col-major) */
   DataT* data;
   /** input labels */
   LabelT* labels;
-  /** total rows in dataset */
+  /** total rows in the unsampled dataset */
   IdxT M;
-  /** total cols in dataset */
+  /** total cols in the unsampled dataset */
   IdxT N;
   /** number of classes (useful only in classification) */
   IdxT nclasses;
@@ -231,22 +230,22 @@ struct Params {
 };
 
 template <typename DataT, typename LabelT, typename IdxT>
-__global__ void initialClassHistKernel(int* gclasshist, const IdxT* rowids,
-                                       const LabelT* labels, IdxT nclasses,
+__global__ void initialClassHistKernel(int* hist, const IdxT* rowids,
+                                       Input<DataT, LabelT, IdxT> input,
                                        IdxT nrows) {
   extern __shared__ int* shist;
-  for (IdxT i = threadIdx.x; i < nclasses; i += blockDim.x) shist = 0;
+  for (IdxT i = threadIdx.x; i < input.nclasses; i += blockDim.x) shist = 0;
   __syncthreads();
   IdxT tid = threadIdx.x + blockIdx.x * blockDim.x;
   IdxT stride = blockDim.x * gridDim.x;
   for (auto i = tid; i < nrows; i += stride) {
     auto row = rowids[i];
-    auto label = labels[row];
+    auto label = input.labels[row];
     atomicAdd(shist + label, 1);
   }
   __syncthreads();
-  for (IdxT i = threadIdx.x; i < nclasses; i += blockDim.x)
-    atomicAdd(gclasshist + i, shist[i]);
+  for (IdxT i = threadIdx.x; i < input.nclasses; i += blockDim.x)
+    atomicAdd(hist + i, shist[i]);
 }
 
 
@@ -270,14 +269,14 @@ __global__ void initSplitKernel(Split<DataT, IdxT>* splits, IdxT batchSize) {
 DI bool signalDone(volatile int* done_count, int nBlks, bool master,
                    void* smem) {
   if (nBlks == 1) return true;
-  auto* amIlast = reinterpret_cast<int*>(smem);
+  auto* sAmIlast = reinterpret_cast<int*>(smem);
   if (threadIdx.x == 0) {
     auto delta = master ? nBlks - 1 : -1;
     auto old = atomicAdd(done_count, delta);
-    *amIlast = ((old + delta) == 0);
+    *sAmIlast = ((old + delta) == 0);
   }
   __syncthreads();
-  return *amIlast;
+  return *sAmIlast;
 }
 
 /**
@@ -306,12 +305,13 @@ DI void giniInfoGain(const int* shist, const DataT* sbins, DataT parentGain,
     auto invRight = One / shist[nbins * 2 * nclasses + nbins + i];
     for (IdxT j = 0; j < nclasses; ++j) {
       auto lval = DataT(shist[i * 2 * nclasses + j]);
-      gain += lval * invLeft * lval * invlen;
+      gain += lval * invLeft * lval;
       auto rval = DataT(shist[i * 2 * nclasses + nclasses + j]);
-      gain += rval * invRight * rval * invlen;
+      gain += rval * invRight * rval;
     }
-    gain = parentGain - One + gain;
-    sp.update(sbins[i], col, gain, nLeft);
+    gain = parentGain - (One - gain * invlen);
+    Split<DataT, IdxT> tmp = {sbins[i], col, gain, nLeft};
+    sp.update(tmp);
   }
 }
 
@@ -328,8 +328,8 @@ DI void evalBestSplit(Split<DataT, IdxT>& s, void* smem,
                       Split<DataT, IdxT>* split, volatile int* mutex) {
   auto* sbest = reinterpret_cast<SplitT*>(smem);
   s.warpReduce();
-  auto warp = threadIdx.x / WarpSize;
-  auto nWarps = blockDim.x / WarpSize;
+  auto warp = threadIdx.x / MLCommon::WarpSize;
+  auto nWarps = blockDim.x / MLCommon::WarpSize;
   auto lane = MLCommon::laneId();
   if (lane == 0) sbest[warp] = s;
   __syncthreads();
@@ -337,7 +337,7 @@ DI void evalBestSplit(Split<DataT, IdxT>& s, void* smem,
   s.warpReduce();
   if (threadIdx.x == 0) {
     while(atomicCAS(mutex, 0, 1));
-    split->update(s.quesval, s.colid, s.gain, s.nLeft);
+    split->update(s);
     __threadfence();
     *mutex = 0;
     __threadfence();
@@ -352,12 +352,6 @@ DI bool leafBasedOnParams(IdxT myDepth, const Params<DataT, IdxT>& params,
   if (nSamples >= params.min_samples) return false;
   if (*n_leaves < params.max_leaves) return false;
   return true;
-}
-
-template <typename DataT, typename IdxT, int TPB>
-DI bool leafBasedOnSplit(const Split<DataT, IdxT>& split,
-                         const Params<DataT, IdxT>& params) {
-  return split.gain < params.min_gain;
 }
 
 /**
@@ -379,8 +373,8 @@ DI void computePrediction(const Pair<IdxT>& range, volatile IdxT* rowids,
   auto tid = threadIdx.x;
   for (int i = tid; i < input.nclasses; i += blockDim.x) shist[i] = 0;
   __syncthreads();
-  auto len = range.x + range.y;
-  for (auto i = range.x + tid; i < len; i += blockDim.x) {
+  auto end = range.x + range.y;
+  for (auto i = range.x + tid; i < end; i += blockDim.x) {
     auto label = input.labels[rowids[i]];
     atomicAdd(shist + label, 1);
   }
@@ -486,12 +480,11 @@ __global__ void nodeSplitKernel(Params<DataT, IdxT> params,
       range, rowids, input, curr_nodes + nid, n_leaves, smem);
     return;
   }
-  partitionSamples<DataT, LabelT, IdxT>(input, splits, curr_nodes, next_nodes,
-                                        rowids, n_nodes, total_nodes, smem);
+  partitionSamples<DataT, LabelT, IdxT, TPB>(
+    input, splits, curr_nodes, next_nodes, rowids, n_nodes, total_nodes, smem);
 }
 
 ///@todo: support regression
-///@todo: support other metrics
 template <typename DataT, typename LabelT, typename IdxT, int TPB>
 __global__ void computeSplitKernel(int* hist, Params<DataT, IdxT> params,
                                    Input<DataT, LabelT, IdxT> input,
@@ -554,6 +547,7 @@ __global__ void computeSplitKernel(int* hist, Params<DataT, IdxT> params,
   __syncthreads();
   Split<DataT, IdxT> sp;
   sp.init();
+  ///@todo: support other metrics
   giniInfoGain<DataT, LabelT, IdxT>(shist, sbins, parentGain, sp, col, range.y,
                                     nbins, nclasses);
   evalBestSplit<DataT, IdxT>(sp, smem, splits + nid, mutex + nid);
@@ -771,19 +765,18 @@ private:
   DataT initialMetric(cudaStream_t s) {
     static constexpr int TPB = 256;
     static constexpr int NITEMS = 8;
-    int nblks = ceildiv(nrows, TPB * NITEMS);
-    size_t smemSize = sizeof(int) * input.nclasses;
     ///@todo: support for regression
     if (isRegression()) {
     } else {
+      int nblks = ceildiv(nrows, TPB * NITEMS);
+      size_t smemSize = sizeof(int) * input.nclasses;
       // reusing `hist` for initial bin computation only
       CUDA_CHECK(cudaMemsetAsync(hist, 0, sizeof(int) * input.nclasses, s));
       initialClassHistKernel<DataT, LabelT, IdxT>
-        <<<nblks, TPB, smemSize, stream>>>(
-          hist, rowids, input.labels, input.nclasses, nrows);
+        <<<nblks, TPB, smemSize, s>>>(hist, rowids, input, nrows);
       CUDA_CHECK(cudaGetLastError());
-      MLCommon::updateHost(h_hist, hist, input.nclasses, stream);
-      CUDA_CHECK(cudaStreamSynchronize(stream));
+      MLCommon::updateHost(h_hist, hist, input.nclasses, s);
+      CUDA_CHECK(cudaStreamSynchronize(s));
       // better to compute the initial metric (after class histograms) on CPU
       ///@todo: support other metrics
       auto out = DataT(1.0);
