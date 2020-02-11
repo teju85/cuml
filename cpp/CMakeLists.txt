@@ -187,6 +187,9 @@ if(KERNEL_INFO)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xptxas=-v")
 endif(KERNEL_INFO)
 
+# Ref: https://github.com/rapidsai/cuml/issues/1658
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xptxas -Werror -Xptxas --warn-on-spills")
+
 if(NVTX)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DNVTX_ENABLED")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNVTX_ENABLED")
