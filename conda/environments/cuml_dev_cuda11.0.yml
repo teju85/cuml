@@ -1,9 +1,9 @@
 name: cuml_dev
 channels:
 - rapidsai
-- nvidia
 - rapidsai-nightly
 - conda-forge
+- nvidia
 dependencies:
 - cudatoolkit=11.0
 - clang=8.0.1
